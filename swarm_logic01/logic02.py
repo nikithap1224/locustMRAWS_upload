@@ -1013,9 +1013,13 @@ def _route_blocked_by_obstacles(start, waypoints, obstacles, grid):
     """
     Check if route from start through waypoints hits any obstacles.
     
-    FIXED: Simulates the actual X-first then Y movement the bot takes,
+    Simulates the actual X-first then Y movement the bot takes,
     not a diagonal line. For each waypoint, the bot goes horizontally
     first, then vertically — check ALL cells along both legs.
+    
+    IMPORTANT: Every cell along the route (including waypoint cells
+    themselves) is checked against obstacles. Only the bot's current
+    position (prev) is skipped since the bot is already standing there.
     """
     prev = start
     for wp in waypoints:
@@ -1035,10 +1039,17 @@ def _route_blocked_by_obstacles(start, waypoints, obstacles, grid):
         if not _close(py, wy):
             cells_v = get_cells_along_segment((wx, py), (wx, wy), grid)
             for cell in cells_v:
-                if _pos_eq(cell, prev) or _pos_eq(cell, wp):
+                if _pos_eq(cell, prev):
                     continue
                 if cell in obstacles:
                     return True
+        
+        # Also check the waypoint cell itself — if it's purely horizontal
+        # or purely vertical from prev, the waypoint is already in the
+        # cells list above. But if prev == wp (no movement), ensure we
+        # still check it.
+        if wp in obstacles and not _pos_eq(wp, prev):
+            return True
         
         prev = wp
     return False
@@ -1062,6 +1073,62 @@ def _score_waypoints(waypoints, start, facing):
 
 
 def _cost(steps, turns): return steps + TURN_WEIGHT * turns
+
+
+def _estimate_ticks(waypoints, bot_facing, grid, bot_pos=None):
+    """
+    Estimate actual tick count for a block path (steps + 1 per turn).
+    Unlike calculate_path_cost which weights turns at TURN_WEIGHT=3 for
+    path selection, this counts real ticks for timing comparisons.
+    """
+    if not waypoints or len(waypoints) < 2:
+        return 0
+    total = 0
+    cur_facing = bot_facing
+    cur_bot = bot_pos
+    
+    for i in range(len(waypoints) - 1):
+        bfrom = waypoints[i]
+        bto   = waypoints[i + 1]
+        dx = bto[0] - bfrom[0]
+        dy = bto[1] - bfrom[1]
+        if abs(dx) < SNAP and abs(dy) < SNAP:
+            continue
+        
+        if abs(dx) > SNAP:
+            pdir = (1 if dx > 0 else -1, 0)
+            staging = (bfrom[0] - (grid if dx > 0 else -grid), bfrom[1])
+        else:
+            pdir = (0, 1 if dy > 0 else -1)
+            staging = (bfrom[0], bfrom[1] - (grid if dy > 0 else -grid))
+        
+        # Nav to staging
+        if cur_bot is not None:
+            nav_d = int((abs(staging[0]-cur_bot[0]) + abs(staging[1]-cur_bot[1])) / grid)
+            total += nav_d
+            # Turns during nav (rough: 1 if L-shaped, 0 if straight)
+            if nav_d > 0:
+                sx = abs(staging[0]-cur_bot[0]) > SNAP
+                sy = abs(staging[1]-cur_bot[1]) > SNAP
+                if sx and sy:
+                    total += 1  # L-shaped nav = 1 turn
+                nav_end_dir = pdir  # approximate
+                if nav_end_dir != cur_facing:
+                    total += 1
+                cur_facing = nav_end_dir
+        
+        # Turn to push
+        if pdir != cur_facing:
+            total += 1
+        
+        # Push
+        seg_cells = int((abs(dx) + abs(dy)) / grid)
+        total += seg_cells
+        cur_facing = pdir
+        if cur_bot is not None:
+            cur_bot = (bto[0] - pdir[0]*grid, bto[1] - pdir[1]*grid)
+    
+    return total
 
 
 def _emergency_step(bx, by, b_x, b_y, push_axis, grid):
@@ -1130,14 +1197,20 @@ HELPER_PUSH_PLANS = {}
 
 
 def _plan_helper_push(state, block_waypoints, active_bot_pos, active_bot_facing,
-                      block_pos, grid, obstacle_classification):
+                      block_pos, grid, obstacle_classification,
+                      active_solo_cost=None):
     """
-    Check if any idle bot can push the block along ANY segment of an L-path
-    while the active bot handles the other segment in PARALLEL.
+    Find the globally optimal (path, segment, helper_bot) combination.
     
-    Tries both XY and YX orderings to find the best helper opportunity.
-    If a helper is found, may OVERRIDE the block_waypoints with a new path
-    that's optimal for parallel execution.
+    Evaluates ALL segments of ALL candidate paths (XY, YX, and the actual
+    detour plan). For each segment S, computes timing model:
+      Phase 1 (parallel): active does prefix segs 0..S-1, helper navigates
+      Phase 2 (gated):    helper pushes seg S (waits for prefix if needed)
+      Phase 3 (sequential): active does suffix segs S+1..N
+    
+    For execution: helper always operates on seg 0 of override_path.
+    When best seg is S>0, helper is deferred — navigates in background
+    while active does prefix, then activates when block reaches seg S.
     
     Returns: helper plan dict or None
     """
@@ -1146,190 +1219,227 @@ def _plan_helper_push(state, block_waypoints, active_bot_pos, active_bot_facing,
     
     goal_pos = block_waypoints[-1]
     
-    # Only try helper for simple L-shaped paths (2 or 3 waypoints)
-    # Complex multi-segment paths are harder to parallelize
-    if len(block_waypoints) > 3:
-        return None
-    
-    # Generate both L-path orderings
+    # Build candidate paths: L-paths + actual plan
     path_xy = generate_l_path(block_pos, goal_pos, 'XY')
     path_yx = generate_l_path(block_pos, goal_pos, 'YX')
     
     candidate_paths = []
-    if len(path_xy) >= 2:
-        candidate_paths.append(('XY', path_xy))
-    if len(path_yx) >= 2 and path_yx != path_xy:
-        candidate_paths.append(('YX', path_yx))
+    seen = set()
+    for label, p in [('XY', path_xy), ('YX', path_yx), ('PLAN', list(block_waypoints))]:
+        key = tuple(tuple(w) for w in p)
+        if key not in seen and len(p) >= 2:
+            seen.add(key)
+            candidate_paths.append((label, p))
     
-    best_helper = None
-    best_savings = 0
+    if active_solo_cost is None:
+        active_solo_cost = _estimate_ticks(block_waypoints, active_bot_facing,
+                                            grid, bot_pos=active_bot_pos)
+    
+    best = None
+    best_total = active_solo_cost  # must beat solo
     
     for path_label, path in candidate_paths:
-        # Helper can only assist with SEGMENT 0 (the first segment)
-        # because the block is already at path[0]. For segment 1+,
-        # the block would need to be moved there first.
-        seg_idx = 0
-        seg_start = path[0]
-        seg_end = path[1]
+        num_segs = len(path) - 1
         
-        seg_dx = seg_end[0] - seg_start[0]
-        seg_dy = seg_end[1] - seg_start[1]
-        
-        if abs(seg_dx) < SNAP and abs(seg_dy) < SNAP:
-            continue
-        
-        # Push direction and cell count for this segment
-        if abs(seg_dx) > SNAP:
-            push_dir = (1 if seg_dx > 0 else -1, 0)
-            num_cells = int(abs(seg_dx) / grid)
-        else:
-            push_dir = (0, 1 if seg_dy > 0 else -1)
-            num_cells = int(abs(seg_dy) / grid)
-        
-        if num_cells < 1:
-            continue
-        
-        # Helper staging: opposite side of push
-        helper_staging = (seg_start[0] - push_dir[0] * grid,
-                          seg_start[1] - push_dir[1] * grid)
-        
-        # Check each idle bot
-        for idle_info in obstacle_classification.get('static_movable', []):
-            idle_pos = idle_info['pos']
-            idle_id = idle_info['bot_id']
-            idle_facing = idle_info.get('facing', (1, 0))
-            
-            # Check staging is clear — exclude THIS idle bot since it will
-            # be the one USING the staging position
-            staging_obstacles = obstacle_classification['all_obstacle_positions'] - {idle_pos}
-            if helper_staging in staging_obstacles:
+        for seg_idx in range(num_segs):
+            seg_start = path[seg_idx]
+            seg_end   = path[seg_idx + 1]
+            seg_dx = seg_end[0] - seg_start[0]
+            seg_dy = seg_end[1] - seg_start[1]
+            if abs(seg_dx) < SNAP and abs(seg_dy) < SNAP:
                 continue
             
-            # Distance to helper staging
-            h_dist = int((abs(idle_pos[0] - helper_staging[0]) + 
-                          abs(idle_pos[1] - helper_staging[1])) / grid)
-            
-            # Helper is only useful if it's CLOSE to staging (0-2 cells).
-            # If it needs to travel far, the nav time eats up all savings
-            # and the bot should just step aside instead.
-            if h_dist > 2:
-                continue
-            
-            # Check route to staging not blocked (exclude self)
-            if h_dist > 0:
-                if _route_blocked_by_obstacles(idle_pos, [helper_staging],
-                                               staging_obstacles, grid):
-                    continue
-            
-            # Turns needed for helper
-            h_turns = 0
-            if h_dist > 0:
-                if abs(idle_pos[0] - helper_staging[0]) > SNAP:
-                    first_dir = (1 if helper_staging[0] > idle_pos[0] else -1, 0)
-                else:
-                    first_dir = (0, 1 if helper_staging[1] > idle_pos[1] else -1)
-                if first_dir != idle_facing:
-                    h_turns += 1
-            elif push_dir != idle_facing:
-                h_turns += 1
-            
-            helper_ticks = h_dist + h_turns + num_cells
-            
-            # What does the active bot do during this time?
-            # It handles the OTHER segment(s) — figure out its staging
-            other_seg_idx = 1 - seg_idx if len(path) == 3 else -1
-            
-            if other_seg_idx >= 0 and other_seg_idx < len(path) - 1:
-                other_start = path[other_seg_idx]
-                other_end = path[other_seg_idx + 1]
-                other_dx = other_end[0] - other_start[0]
-                other_dy = other_end[1] - other_start[1]
-                
-                if abs(other_dx) > SNAP:
-                    active_staging = (other_start[0] - (grid if other_dx > 0 else -grid), other_start[1])
-                elif abs(other_dy) > SNAP:
-                    active_staging = (other_start[0], other_start[1] - (grid if other_dy > 0 else -grid))
-                else:
-                    continue
-                
-                # Active bot nav ticks to its staging
-                a_dist = int((abs(active_staging[0] - active_bot_pos[0]) + 
-                              abs(active_staging[1] - active_bot_pos[1])) / grid)
-                a_turns = 0
-                if a_dist > 0:
-                    adx = active_staging[0] - active_bot_pos[0]
-                    ady = active_staging[1] - active_bot_pos[1]
-                    if abs(adx) > SNAP:
-                        first_dir = (1 if adx > 0 else -1, 0)
-                    else:
-                        first_dir = (0, 1 if ady > 0 else -1)
-                    if first_dir != active_bot_facing:
-                        a_turns += 1
-                    if abs(adx) > SNAP and abs(ady) > SNAP:
-                        a_turns += 1
-                
-                active_nav_ticks = a_dist + a_turns
-                
-                # Remaining push by active bot (the other segment)
-                other_push_cells = int((abs(other_dx) + abs(other_dy)) / grid)
-                # Turn to face push direction
-                remaining_push_ticks = other_push_cells + 1  # +1 for turn
-                
-                # Parallel phase + sequential remaining
-                parallel_phase = max(helper_ticks, active_nav_ticks)
-                total_ticks = parallel_phase + remaining_push_ticks
+            if abs(seg_dx) > SNAP:
+                push_dir  = (1 if seg_dx > 0 else -1, 0)
+                num_cells = int(abs(seg_dx) / grid)
             else:
-                # Helper does everything (single segment path)
-                total_ticks = helper_ticks
+                push_dir  = (0, 1 if seg_dy > 0 else -1)
+                num_cells = int(abs(seg_dy) / grid)
+            if num_cells < 1:
+                continue
             
-            # Solo cost
-            solo_cost = calculate_path_cost(path, active_bot_facing, grid, 
-                                            bot_pos=active_bot_pos)
+            helper_staging = (seg_start[0] - push_dir[0] * grid,
+                              seg_start[1] - push_dir[1] * grid)
             
-            savings = solo_cost - total_ticks
+            # PREFIX tick count (active bot does segs 0..S-1)
+            if seg_idx > 0:
+                prefix_cost = _estimate_ticks(
+                    path[:seg_idx + 1], active_bot_facing, grid,
+                    bot_pos=active_bot_pos)
+            else:
+                prefix_cost = 0
             
-            if savings > 0 and savings > best_savings:
-                # Verify the path is valid — but exclude the helper bot
-                # from obstacles since it will be USING that staging position
-                helper_excluded_obs = {
+            # SUFFIX cost (active bot does segs S+1..N)
+            has_suffix = seg_idx + 1 < num_segs
+            suf_staging = None
+            if has_suffix:
+                suf_s = path[seg_idx + 1]
+                suf_e = path[seg_idx + 2]
+                sdx   = suf_e[0] - suf_s[0]
+                sdy   = suf_e[1] - suf_s[1]
+                if abs(sdx) > SNAP:
+                    suf_staging = (suf_s[0] - (grid if sdx > 0 else -grid), suf_s[1])
+                elif abs(sdy) > SNAP:
+                    suf_staging = (suf_s[0], suf_s[1] - (grid if sdy > 0 else -grid))
+                else:
+                    continue
+                suffix_cost = _estimate_ticks(
+                    path[seg_idx + 1:], push_dir, grid, bot_pos=suf_staging)
+            else:
+                suffix_cost = 0
+            
+            # Check each idle bot
+            for idle_info in obstacle_classification.get('static_movable', []):
+                idle_pos    = idle_info['pos']
+                idle_id     = idle_info['bot_id']
+                idle_facing = idle_info.get('facing', (1, 0))
+                
+                stg_obs = obstacle_classification['all_obstacle_positions'] - {idle_pos}
+                if helper_staging in stg_obs:
+                    continue
+                
+                h_dist = int((abs(idle_pos[0] - helper_staging[0]) +
+                              abs(idle_pos[1] - helper_staging[1])) / grid)
+                if h_dist > 6:
+                    continue
+                
+                # Route check: X-first then Y-first
+                if h_dist > 0:
+                    route_ok = False
+                    if not _route_blocked_by_obstacles(idle_pos, [helper_staging], stg_obs, grid):
+                        route_ok = True
+                    if not route_ok:
+                        ix, iy = idle_pos
+                        hsx, hsy = helper_staging
+                        if not _close(ix, hsx) and not _close(iy, hsy):
+                            yblk = False
+                            for c in get_cells_along_segment((ix, iy), (ix, hsy), grid):
+                                if not _pos_eq(c, idle_pos) and c in stg_obs:
+                                    yblk = True; break
+                            if not yblk:
+                                for c in get_cells_along_segment((ix, hsy), (hsx, hsy), grid):
+                                    if not _pos_eq(c, (ix, hsy)) and c in stg_obs:
+                                        yblk = True; break
+                            if not yblk:
+                                route_ok = True
+                    if not route_ok:
+                        continue
+                
+                # Helper timing
+                h_turns = 0
+                if h_dist > 0:
+                    if abs(idle_pos[0] - helper_staging[0]) > SNAP:
+                        fd = (1 if helper_staging[0] > idle_pos[0] else -1, 0)
+                    else:
+                        fd = (0, 1 if helper_staging[1] > idle_pos[1] else -1)
+                    if fd != idle_facing:
+                        h_turns = 1
+                elif push_dir != idle_facing:
+                    h_turns = 1
+                
+                helper_ready = h_dist + h_turns
+                push_start   = max(prefix_cost, helper_ready)
+                helper_done  = push_start + num_cells
+                # Penalty: after helper finishes, it may block active bot's suffix nav.
+                # The longer the helper push, the more likely it's in the way.
+                # Add a small penalty for helper segments > 2 cells.
+                collision_penalty = max(0, num_cells - 2) * 2
+                total_ticks  = helper_done + suffix_cost + collision_penalty
+                
+                if total_ticks >= best_total:
+                    continue
+                
+                # Validate path (exclude helper from obstacles)
+                excl_obs = {
                     'static_immovable': obstacle_classification['static_immovable'],
                     'static_movable': [o for o in obstacle_classification['static_movable']
                                       if o['bot_id'] != idle_id],
                     'dynamic_predictable': obstacle_classification['dynamic_predictable'],
                     'all_obstacle_positions': obstacle_classification['all_obstacle_positions'] - {idle_pos}
                 }
-                
-                eval_result = evaluate_path_with_obstacles(
-                    path, helper_excluded_obs, grid, active_bot_facing,
-                    bot_pos=active_bot_pos
-                )
-                if not eval_result['valid']:
+                ev = evaluate_path_with_obstacles(path, excl_obs, grid,
+                                                   active_bot_facing, bot_pos=active_bot_pos)
+                if not ev['valid']:
                     continue
                 
-                print(f"  🤝 Helper {idle_id} on {path_label} seg{seg_idx}:")
-                print(f"     Helper: {h_dist} nav + {h_turns} turns + {num_cells} pushes = {helper_ticks} ticks")
-                print(f"     Active nav: {active_nav_ticks} ticks")
-                print(f"     Parallel: {parallel_phase}, remaining: {remaining_push_ticks if other_seg_idx >= 0 else 0}")
-                print(f"     Total: {total_ticks} vs solo: {solo_cost} → saves {savings}")
+                savings = active_solo_cost - total_ticks
+                print(f"  \u1f91d Helper {idle_id} on {path_label} seg{seg_idx}: "
+                      f"nav={h_dist}+turn={h_turns} push={num_cells} "
+                      f"prefix={prefix_cost} total={total_ticks} saves={savings}")
                 
-                best_helper = {
-                    'helper_bot_id': idle_id,
-                    'helper_staging': helper_staging,
-                    'push_direction': push_dir,
-                    'num_pushes': num_cells,
-                    'block_id': state['blocks'][0]['id'],
-                    'active_bot_target': active_staging if other_seg_idx >= 0 else None,
-                    'new_waypoint_start': seg_idx + 1,
-                    'override_path': path,  # May differ from original plan
-                    'savings': savings,
-                }
-                best_savings = savings
+                if seg_idx == 0:
+                    best = {
+                        'helper_bot_id': idle_id,
+                        'helper_staging': helper_staging,
+                        'push_direction': push_dir,
+                        'num_pushes': num_cells,
+                        'block_id': state['blocks'][0]['id'],
+                        'active_bot_target': suf_staging,
+                        'new_waypoint_start': 1,
+                        'override_path': path,
+                        'helper_seg_idx': 0,
+                        'savings': savings,
+                    }
+                else:
+                    best = {
+                        'helper_bot_id': idle_id,
+                        'helper_staging': helper_staging,
+                        'push_direction': push_dir,
+                        'num_pushes': num_cells,
+                        'block_id': state['blocks'][0]['id'],
+                        'active_bot_target': suf_staging,
+                        'new_waypoint_start': seg_idx + 1,
+                        'override_path': path[seg_idx:],
+                        'full_path': path,
+                        'helper_seg_idx': seg_idx,
+                        'savings': savings,
+                    }
+                best_total = total_ticks
     
-    if best_helper:
-        print(f"\n  ✅ HELPER PLAN: {best_helper['helper_bot_id']} pushes {best_helper['num_pushes']} cells")
-        print(f"     Saves ~{best_helper['savings']} ticks vs solo")
+    if best:
+        seg = best['helper_seg_idx']
+        print(f"\n  \u2705 HELPER: {best['helper_bot_id']} on seg{seg} "
+              f"({best['num_pushes']} pushes, saves {best['savings']})")
     
-    return best_helper
+    return best
+
+
+def _helper_nav_step(hx, hy, target_x, target_y, facing, occupied, grid_size):
+    """
+    Pick the best single-step move for helper bot toward target.
+    Prefers the axis matching current facing to minimize rotation ticks.
+    Returns (dx, dy) or None if completely blocked.
+    """
+    hdx = target_x - hx
+    hdy = target_y - hy
+    blocked = occupied - {(hx, hy)}
+    
+    # Build candidate moves: (dx, dy, remaining_distance_on_this_axis)
+    candidates = []
+    if abs(hdx) >= SNAP:
+        candidates.append((grid_size if hdx > 0 else -grid_size, 0, abs(hdx)))
+    if abs(hdy) >= SNAP:
+        candidates.append((0, grid_size if hdy > 0 else -grid_size, abs(hdy)))
+    
+    if not candidates:
+        return None
+    
+    # Sort: prefer axis matching current facing (avoids rotation tick),
+    # then prefer the longer remaining axis (finish one axis before switching)
+    def sort_key(c):
+        dx, dy, dist = c
+        move_dir = (1 if dx > 0 else (-1 if dx < 0 else 0),
+                    1 if dy > 0 else (-1 if dy < 0 else 0))
+        matches_facing = 1 if move_dir == facing else 0
+        return (-matches_facing, -dist)
+    
+    candidates.sort(key=sort_key)
+    
+    for dx, dy, _ in candidates:
+        if (hx + dx, hy + dy) not in blocked:
+            return (dx, dy)
+    
+    return None
 
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
@@ -1429,6 +1539,33 @@ def compute_swarm_moves(state, grid_size):
     g_x   = _snap(goal['pos'][0],  grid_size)
     g_y   = _snap(goal['pos'][1],  grid_size)
 
+    # ── DEFERRED HELPER: navigate to staging in background ──────────
+    # This must run BEFORE rotation detection, because rotation detection
+    # does an early return that would skip the helper.
+    if bot_id in BOT_STATES:
+        _s = BOT_STATES[bot_id]
+        _deferred = _s.get('deferred_helper')
+        if _deferred and not _s.get('helper_plan'):
+            _d_id = _deferred['helper_bot_id']
+            _d_staging = _deferred['helper_staging']
+            _d_push_dir = _deferred['push_direction']
+            for _hb in state['bots']:
+                if _hb['id'] == _d_id:
+                    _dhx = _snap(_hb['pos'][0], grid_size)
+                    _dhy = _snap(_hb['pos'][1], grid_size)
+                    _d_facing = _hb.get('facing', (1, 0))
+                    if abs(_d_staging[0] - _dhx) >= SNAP or abs(_d_staging[1] - _dhy) >= SNAP:
+                        _nav = _helper_nav_step(_dhx, _dhy, _d_staging[0], _d_staging[1],
+                                                _d_facing, occupied, grid_size)
+                        if _nav:
+                            moves[_d_id] = (_nav[0], _nav[1], None)
+                    else:
+                        # At staging — pre-orient to push direction
+                        if _d_facing != _d_push_dir:
+                            moves[_d_id] = (_d_push_dir[0] * grid_size,
+                                            _d_push_dir[1] * grid_size, None)
+                    break
+
     # ── ROTATION DETECTION: If bot hasn't moved since last tick, ──────
     # the UI is doing a rotation. Re-issue the same move command.
     if bot_id in BOT_STATES:
@@ -1509,17 +1646,40 @@ def compute_swarm_moves(state, grid_size):
                     }
         
         # ── HELPER BOT PLANNING ───────────────────────────────────────
+        solo_ticks = _estimate_ticks(path_plan['waypoints'], (1, 0),
+                                      grid_size, bot_pos=(bot_x, bot_y))
         helper_plan = _plan_helper_push(
             state, path_plan['waypoints'],
             (bot_x, bot_y), (1, 0),
-            (b_x, b_y), grid_size, obstacle_classification
+            (b_x, b_y), grid_size, obstacle_classification,
+            active_solo_cost=solo_ticks
         )
         
         # If helper plan overrides the path, use the helper's preferred path
+        # When helper is on seg > 0, we defer it: active bot does prefix solo,
+        # and the helper will be re-evaluated when the block reaches that segment.
         final_waypoints = path_plan['waypoints']
-        if helper_plan and helper_plan.get('override_path'):
-            final_waypoints = helper_plan['override_path']
-            print(f"  🤝 Overriding path with helper-optimal: {final_waypoints}")
+        active_helper_plan = None
+        
+        if helper_plan:
+            seg = helper_plan.get('helper_seg_idx', 0)
+            # Cancel any pending move request for the helper bot —
+            # the helper has its own navigation plan to staging
+            h_id = helper_plan['helper_bot_id']
+            if h_id in PENDING_MOVE_REQUESTS:
+                print(f"  🤝 Cancelling pending move request for helper {h_id}")
+                del PENDING_MOVE_REQUESTS[h_id]
+            if seg == 0:
+                # Helper on seg 0 — activate immediately
+                active_helper_plan = helper_plan
+                if helper_plan.get('override_path'):
+                    final_waypoints = helper_plan['override_path']
+                    print(f"  🤝 Overriding path with helper-optimal: {final_waypoints}")
+            else:
+                # Helper on later segment — use full path, defer helper activation
+                final_waypoints = helper_plan['full_path']
+                print(f"  🤝 Deferred helper on seg{seg} — active bot does prefix first")
+                print(f"     Full path: {final_waypoints}")
         
         BOT_STATES[bot_id] = {
             'phase': 'NAV',
@@ -1531,7 +1691,8 @@ def compute_swarm_moves(state, grid_size):
             'wait_periods': path_plan['wait_periods'],
             'obstacle_classification': obstacle_classification,
             'waiting_for_clear': False,
-            'helper_plan': helper_plan,
+            'helper_plan': active_helper_plan,
+            'deferred_helper': helper_plan if helper_plan and helper_plan.get('helper_seg_idx', 0) > 0 else None,
         }
 
     s = BOT_STATES[bot_id]
@@ -1561,10 +1722,20 @@ def compute_swarm_moves(state, grid_size):
     current_waypoint_idx = s['current_waypoint_idx']
     
     # ── HELPER BOT EXECUTION ──────────────────────────────────────────
-    # If a helper plan exists, the helper bot pushes the block along
-    # the first segment while the active bot navigates in parallel.
+    # The helper pushes segment S while the active bot handles prefix/suffix.
+    # If helper_seg_idx > 0, the active bot works on prefix segments normally
+    # while the helper navigates to its staging in the background.
     helper_plan = s.get('helper_plan')
     helper_pushing_this_tick = False
+    helper_seg_idx = helper_plan.get('helper_seg_idx', 0) if helper_plan else 0
+    
+    # Is the helper currently handling a segment?
+    # True when block is at or past the helper's segment start AND helper has pushes left
+    block_at_helper_seg = False
+    if helper_plan and helper_plan.get('num_pushes', 0) > 0:
+        # Helper is active — gate the active bot regardless of block position
+        block_at_helper_seg = True
+    
     if helper_plan and helper_plan.get('num_pushes', 0) > 0:
         helper_id = helper_plan['helper_bot_id']
         push_dir = helper_plan['push_direction']
@@ -1586,8 +1757,7 @@ def compute_swarm_moves(state, grid_size):
             last_helper_pos = helper_plan.get('last_helper_pos')
             last_helper_move = helper_plan.get('last_helper_move')
             
-            # Rotation detection for helper: if we issued a push/move last tick
-            # but helper hasn't moved, the UI is rotating. Re-issue same command.
+            # Rotation detection for helper
             if (last_helper_move and last_helper_pos and
                 last_helper_move != (0, 0, None) and
                 _pos_eq((hx, hy), last_helper_pos)):
@@ -1597,69 +1767,85 @@ def compute_swarm_moves(state, grid_size):
             elif (last_helper_move and last_helper_pos and
                   last_helper_move[2] is not None and
                   not _pos_eq((hx, hy), last_helper_pos)):
-                # Helper MOVED since last tick and last move was a push — 
-                # the push succeeded! Now decrement num_pushes.
+                # Helper push landed
                 helper_plan['num_pushes'] -= 1
                 print(f"  🤝 Helper push landed! ({helper_plan['num_pushes']} remaining)")
                 
                 if helper_plan['num_pushes'] <= 0:
                     print(f"  🤝 Helper DONE. Active bot takes over.")
-                    s['current_waypoint_idx'] = helper_plan.get('new_waypoint_start', 1)
+                    s['current_waypoint_idx'] = helper_plan.get('new_waypoint_start', helper_seg_idx + 1)
                     s['helper_plan'] = None
                     s['waypoint_queue'] = []
                     s['obstacle_classification'] = classify_obstacles(state, grid_size)
                 else:
-                    # More pushes needed — check if still adjacent
                     expected_block_x = hx + push_dir[0] * grid_size
                     expected_block_y = hy + push_dir[1] * grid_size
                     if _pos_eq((b_x, b_y), (expected_block_x, expected_block_y)):
-                        push_dx = push_dir[0] * grid_size
-                        push_dy = push_dir[1] * grid_size
-                        moves[helper_id] = (push_dx, push_dy, block_id_to_push)
+                        moves[helper_id] = (push_dir[0]*grid_size, push_dir[1]*grid_size, block_id_to_push)
                         helper_pushing_this_tick = True
-                    # else: will be handled by the adjacency check below on next tick
-            else:
-                # Check if helper is adjacent to the block in the push direction
+            elif block_at_helper_seg:
+                # Block is at helper's segment — helper should push
                 expected_block_x = hx + push_dir[0] * grid_size
                 expected_block_y = hy + push_dir[1] * grid_size
                 
                 if _pos_eq((b_x, b_y), (expected_block_x, expected_block_y)):
-                    # Helper is in position — issue push command
-                    push_dx = push_dir[0] * grid_size
-                    push_dy = push_dir[1] * grid_size
-                    moves[helper_id] = (push_dx, push_dy, block_id_to_push)
+                    moves[helper_id] = (push_dir[0]*grid_size, push_dir[1]*grid_size, block_id_to_push)
                     helper_pushing_this_tick = True
-                    
-                    # DON'T decrement num_pushes here — wait until we confirm
-                    # the push actually happened (bot moved) on the next tick.
-                    # This handles rotation ticks correctly.
                     if helper_facing == push_dir:
                         print(f"  🤝 Helper {helper_id} pushing (facing correct)")
                     else:
                         print(f"  🤝 Helper {helper_id} turning to face {push_dir}")
-                    
-                    # Note: completion check moved to "push landed" detection above
                 else:
-                    # Helper not adjacent to block — navigate to staging
+                    # Helper at staging but block not adjacent yet
                     helper_staging = helper_plan.get('helper_staging')
-                    if helper_staging:
+                    if helper_staging and _pos_eq((hx, hy), helper_staging):
+                        # At staging, waiting for block — pre-orient to push direction
+                        if helper_facing != push_dir:
+                            orient_dx = push_dir[0] * grid_size
+                            orient_dy = push_dir[1] * grid_size
+                            moves[helper_id] = (orient_dx, orient_dy, None)
+                            print(f"  🤝 Helper pre-orienting to face {push_dir}")
+                        else:
+                            print(f"  🤝 Helper at staging, ready to push")
+                    elif helper_staging:
+                        # Still navigating
                         hdx = helper_staging[0] - hx
                         hdy = helper_staging[1] - hy
-                        
                         if abs(hdx) < SNAP and abs(hdy) < SNAP:
-                            print(f"  🤝 Helper at staging but block not adjacent, cancelling")
+                            print(f"  🤝 Helper at staging, block not adjacent — cancelling")
                             s['helper_plan'] = None
-                        elif abs(hdx) >= SNAP:
-                            step_dx = grid_size if hdx > 0 else -grid_size
-                            moves[helper_id] = (step_dx, 0, None)
-                            print(f"  🤝 Helper {helper_id} navigating to staging {helper_staging}")
-                        elif abs(hdy) >= SNAP:
-                            step_dy = grid_size if hdy > 0 else -grid_size
-                            moves[helper_id] = (0, step_dy, None)
-                            print(f"  🤝 Helper {helper_id} navigating to staging {helper_staging}")
+                        else:
+                            nav = _helper_nav_step(hx, hy, helper_staging[0], helper_staging[1],
+                                                   helper_facing, occupied, grid_size)
+                            if nav:
+                                moves[helper_id] = (nav[0], nav[1], None)
+                            else:
+                                s['helper_plan'] = None
                     else:
-                        print(f"  🤝 Helper: no staging, cancelling")
                         s['helper_plan'] = None
+            else:
+                # Block hasn't reached helper's segment yet —
+                # helper navigates to staging in the background
+                helper_staging = helper_plan.get('helper_staging')
+                if helper_staging:
+                    hdx = helper_staging[0] - hx
+                    hdy = helper_staging[1] - hy
+                    
+                    if abs(hdx) >= SNAP or abs(hdy) >= SNAP:
+                        nav = _helper_nav_step(hx, hy, helper_staging[0], helper_staging[1],
+                                               helper_facing, occupied, grid_size)
+                        if nav:
+                            moves[helper_id] = (nav[0], nav[1], None)
+                            print(f"  🤝 Helper {helper_id} nav toward staging {helper_staging}")
+                        else:
+                            print(f"  🤝 Helper blocked, cancelling")
+                            s['helper_plan'] = None
+                    # else: already at staging — pre-orient to push direction
+                    else:
+                        if helper_facing != push_dir:
+                            orient_dx = push_dir[0] * grid_size
+                            orient_dy = push_dir[1] * grid_size
+                            moves[helper_id] = (orient_dx, orient_dy, None)
             
             # Store position and move for rotation detection next tick
             helper_plan_ref = s.get('helper_plan')
@@ -1667,68 +1853,55 @@ def compute_swarm_moves(state, grid_size):
                 helper_plan_ref['last_helper_pos'] = (hx, hy)
                 helper_plan_ref['last_helper_move'] = moves.get(helper_id, (0, 0, None))
         
-        # While helper pushes, active bot navigates to intercept position
+        # Gate active bot: only wait if block is at helper's segment
+        # AND helper still has pushes to do
+        helper_still_active = helper_plan and helper_plan.get('num_pushes', 0) > 0
         active_target = helper_plan.get('active_bot_target') if helper_plan else None
-        if active_target and helper_pushing_this_tick:
-            # Active bot should navigate toward the intercept staging
-            adx = active_target[0] - bot_x
-            ady = active_target[1] - bot_y
-            
-            if abs(adx) >= SNAP or abs(ady) >= SNAP:
-                move_dx = 0
-                move_dy = 0
-                if abs(adx) >= SNAP:
-                    move_dx = grid_size if adx > 0 else -grid_size
-                elif abs(ady) >= SNAP:
-                    move_dy = grid_size if ady > 0 else -grid_size
+        
+        if block_at_helper_seg and helper_still_active:
+            # Block is at helper's segment — active bot must NOT push
+            if active_target:
+                adx = active_target[0] - bot_x
+                ady = active_target[1] - bot_y
+                if abs(adx) >= SNAP or abs(ady) >= SNAP:
+                    move_dx = move_dy = 0
+                    if abs(adx) >= SNAP:
+                        move_dx = grid_size if adx > 0 else -grid_size
+                    elif abs(ady) >= SNAP:
+                        move_dy = grid_size if ady > 0 else -grid_size
+                    
+                    check_occupied = occupied - {(bot_x, bot_y)}
+                    helper_move = moves.get(helper_id, (0,0,None))
+                    if helper_move[2] is not None:
+                        check_occupied.add((b_x + push_dir[0]*grid_size, b_y + push_dir[1]*grid_size))
+                        if helper_bot:
+                            check_occupied.add((_snap(helper_bot['pos'][0],grid_size)+push_dir[0]*grid_size,
+                                               _snap(helper_bot['pos'][1],grid_size)+push_dir[1]*grid_size))
+                    
+                    next_pos = (bot_x + move_dx, bot_y + move_dy)
+                    if next_pos not in check_occupied:
+                        facing = (move_dx//grid_size if move_dx else 0, move_dy//grid_size if move_dy else 0)
+                        BOT_STATES[bot_id]['facing'] = list(facing)
+                        final_move = (move_dx, move_dy, None)
+                        BOT_STATES[bot_id]['last_issued_move'] = final_move
+                        BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
+                        moves[bot_id] = final_move
+                        print(f"  🏃 Active bot navigating to suffix staging")
+                        return moves
                 
-                # COLLISION CHECK: account for where block WILL BE after
-                # helper's push this tick (simultaneous movement)
-                check_occupied = occupied - {(bot_x, bot_y)}
-                # If helper is pushing this tick, the block will move
-                helper_move = moves.get(helper_id, (0,0,None))
-                if helper_move[2] is not None:  # helper is pushing
-                    # Block will be at its current pos + push direction
-                    block_dest = (b_x + push_dir[0] * grid_size,
-                                  b_y + push_dir[1] * grid_size)
-                    check_occupied.add(block_dest)
-                    # Helper will also move
-                    if helper_bot:
-                        helper_dest = (_snap(helper_bot['pos'][0], grid_size) + push_dir[0] * grid_size,
-                                      _snap(helper_bot['pos'][1], grid_size) + push_dir[1] * grid_size)
-                        check_occupied.add(helper_dest)
-                
-                next_pos = (bot_x + move_dx, bot_y + move_dy)
-                if next_pos in check_occupied:
-                    # Cell will be occupied — wait this tick
-                    print(f"  🏃 Active bot waiting — {next_pos} will be occupied")
-                    BOT_STATES[bot_id]['last_issued_move'] = (0, 0, None)
-                    BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
-                    return moves
-                
-                # Update facing
-                if move_dx != 0 or move_dy != 0:
-                    facing = (move_dx // grid_size if move_dx else 0,
-                              move_dy // grid_size if move_dy else 0)
-                
-                BOT_STATES[bot_id]['facing'] = list(facing)
-                final_move = (move_dx, move_dy, None)
-                BOT_STATES[bot_id]['last_issued_move'] = final_move
-                BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
-                moves[bot_id] = final_move
-                print(f"  🏃 Active bot navigating to intercept {active_target}")
-                return moves
-            else:
-                # Active bot reached intercept — wait for helper to finish
-                print(f"  ⏳ Active bot at intercept, waiting for helper...")
+                print(f"  ⏳ Active bot waiting for helper to finish seg{helper_seg_idx}...")
                 BOT_STATES[bot_id]['last_issued_move'] = (0, 0, None)
                 BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
                 return moves
-        elif helper_pushing_this_tick:
-            # No intercept target but helper still active — just wait
-            BOT_STATES[bot_id]['last_issued_move'] = (0, 0, None)
-            BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
-            return moves
+            else:
+                print(f"  ⏳ Active bot waiting for helper to finish seg{helper_seg_idx}...")
+                BOT_STATES[bot_id]['last_issued_move'] = (0, 0, None)
+                BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
+                return moves
+        
+        # If helper_seg_idx == 0 and block not at seg yet, active must also wait
+        # (because block starts at seg 0, so block_at_helper_seg should be true)
+        # For seg_idx > 0, active bot falls through to normal NAV/PUSH below
     
     # Get obstacle classification (refresh for moved bots)
     obstacle_classification = s.get('obstacle_classification')
@@ -1773,6 +1946,33 @@ def compute_swarm_moves(state, grid_size):
         
         target_waypoint = block_waypoints[current_waypoint_idx]
         print(f"   Next target: {target_waypoint}")
+        
+        # ── DEFERRED HELPER ACTIVATION ──
+        # When block reaches the deferred helper's segment start, activate it
+        deferred = s.get('deferred_helper')
+        if deferred and not s.get('helper_plan'):
+            dseg = deferred.get('helper_seg_idx', 0)
+            if current_waypoint_idx == dseg + 1:
+                helper_id = deferred['helper_bot_id']
+                helper_staging = deferred['helper_staging']
+                for hb in state['bots']:
+                    if hb['id'] == helper_id:
+                        hx = _snap(hb['pos'][0], grid_size)
+                        hy = _snap(hb['pos'][1], grid_size)
+                        h_dist = int((abs(hx - helper_staging[0]) + abs(hy - helper_staging[1])) / grid_size)
+                        if h_dist <= 1:
+                            print(f"   🤝 Activating deferred helper {helper_id} on seg{dseg}")
+                            s['helper_plan'] = deferred
+                            s['deferred_helper'] = None
+                            # Stop active bot immediately — helper takes over
+                            BOT_STATES[bot_id]['last_issued_move'] = (0, 0, None)
+                            BOT_STATES[bot_id]['last_seen_pos'] = (bot_x, bot_y)
+                            moves[bot_id] = (0, 0, None)
+                            return moves
+                        else:
+                            print(f"   🤝 Deferred helper too far ({h_dist} cells), skipping")
+                            s['deferred_helper'] = None
+                        break
     
     # Plan push toward current waypoint
     push_dx, push_dy, stg_x, stg_y, push_axis = _push_plan_to_waypoint(
@@ -1821,28 +2021,37 @@ def compute_swarm_moves(state, grid_size):
             if nav_stuck > 6:
                 # Bot is oscillating — NAV can't reach staging.
                 # The block path itself needs to change.
-                print(f"\n🔄 NAV stuck for {nav_stuck} ticks — full replan!")
-                s['nav_stuck_count'] = 0
+                replan_attempts = s.get('replan_attempts', 0) + 1
+                s['replan_attempts'] = replan_attempts
                 
-                new_obs = classify_obstacles(state, grid_size)
-                new_plan = find_optimal_block_path(
-                    (b_x, b_y), (g_x, g_y),
-                    new_obs, grid_size,
-                    bot_facing=facing,
-                    bot_pos=(bot_x, bot_y)
-                )
-                
-                if new_plan is None:
+                if replan_attempts > 3:
+                    # Too many failed replans — truly stuck
+                    print(f"\n❌ Replan failed {replan_attempts} times — marking STUCK")
                     s['phase'] = 'STUCK'
                     move_dx, move_dy = 0, 0
                 else:
-                    s['block_waypoints'] = new_plan['waypoints']
-                    s['current_waypoint_idx'] = 0
-                    s['waypoint_queue'] = []
-                    s['obstacle_classification'] = new_obs
-                    block_waypoints = new_plan['waypoints']
-                    wq = []
-                    move_dx, move_dy = 0, 0
+                    print(f"\n🔄 NAV stuck for {nav_stuck} ticks — full replan (attempt {replan_attempts})!")
+                    s['nav_stuck_count'] = 0
+                    
+                    new_obs = classify_obstacles(state, grid_size)
+                    new_plan = find_optimal_block_path(
+                        (b_x, b_y), (g_x, g_y),
+                        new_obs, grid_size,
+                        bot_facing=facing,
+                        bot_pos=(bot_x, bot_y)
+                    )
+                    
+                    if new_plan is None:
+                        s['phase'] = 'STUCK'
+                        move_dx, move_dy = 0, 0
+                    else:
+                        s['block_waypoints'] = new_plan['waypoints']
+                        s['current_waypoint_idx'] = 0
+                        s['waypoint_queue'] = []
+                        s['obstacle_classification'] = new_obs
+                        block_waypoints = new_plan['waypoints']
+                        wq = []
+                        move_dx, move_dy = 0, 0
 
     # ── PUSH phase ─────────────────────────────────────────────────
     if phase == 'PUSH':
